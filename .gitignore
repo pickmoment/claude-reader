@@ -1,0 +1,8 @@
+# binary
+claude-reader
+
+# screenshots (dev artifacts)
+screenshots/
+
+# macOS
+.DS_Store

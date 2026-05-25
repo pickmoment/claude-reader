@@ -1,0 +1,47 @@
+{{define "base"}}<!DOCTYPE html>
+<html lang="ko" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{block "title" .}}Claude Reader{{end}}</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+  <script>
+    (function(){
+      var t = localStorage.getItem('theme') || 'dark';
+      var f = parseInt(localStorage.getItem('fontSize') || '16');
+      document.documentElement.setAttribute('data-theme', t);
+      document.documentElement.style.setProperty('--font-size-base', f + 'px');
+    })();
+  </script>
+</head>
+<body>
+  <nav class="nav">
+    <a href="/" class="nav-brand">
+      <span class="brand-icon">◈</span>
+      <span class="brand-text">Claude Reader</span>
+    </a>
+    <div class="nav-links">
+      <a href="/" class="nav-link">대시보드</a>
+      <a href="/projects" class="nav-link">프로젝트</a>
+    </div>
+    <form action="/search" method="get" class="nav-search">
+      <input type="search" name="q" placeholder="세션 검색..." class="search-input">
+      <button type="submit" class="search-btn">⌕</button>
+    </form>
+    <div class="nav-controls">
+      <div class="font-ctrl">
+        <span class="font-ctrl-a">A</span>
+        <input type="range" id="font-slider" min="12" max="24" step="1" value="16" class="font-slider">
+        <span class="font-ctrl-a font-ctrl-a-lg">A</span>
+        <span class="font-size-val" id="font-size-val">16px</span>
+      </div>
+      <div class="ctrl-sep"></div>
+      <button class="ctrl-btn" id="btn-theme" onclick="toggleTheme()" title="테마 전환">☀</button>
+    </div>
+  </nav>
+  <main class="main">
+    {{block "content" .}}{{end}}
+  </main>
+  <script src="/static/js/app.js"></script>
+</body>
+</html>{{end}}

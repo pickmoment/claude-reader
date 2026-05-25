@@ -1,0 +1,48 @@
+{{template "base" .}}
+{{define "title"}}검색 — Claude Reader{{end}}
+{{define "content"}}
+<div class="page-header">
+  <h1 class="page-title">검색</h1>
+</div>
+
+<form action="/search" method="get" class="search-form">
+  <div class="search-row">
+    <input type="search" name="q" value="{{.Query}}" placeholder="키워드를 입력하세요..." class="search-main-input" autofocus>
+    <button type="submit" class="search-main-btn">검색</button>
+  </div>
+  <div class="search-filters">
+    <select name="project" class="filter-select">
+      <option value="">모든 프로젝트</option>
+      {{range .Projects}}
+      <option value="{{.DirName}}" {{if eq $.Filter.ProjectDir .DirName}}selected{{end}}>{{.Name}}</option>
+      {{end}}
+    </select>
+    <input type="date" name="from" value="{{.Filter.DateFrom}}" class="filter-date" title="시작일">
+    <span class="filter-sep">~</span>
+    <input type="date" name="to" value="{{.Filter.DateTo}}" class="filter-date" title="종료일">
+  </div>
+</form>
+
+{{if or .Results .Filter.ProjectDir .Filter.DateFrom .Filter.DateTo}}
+<div class="search-results-header">
+  <span class="results-count">{{len .Results}}개 결과</span>
+  {{if .Query}}<span class="results-query">"{{.Query}}"</span>{{end}}
+</div>
+
+<div class="search-results">
+  {{range .Results}}
+  <a href="/sessions/{{.ProjectDir}}/{{.SessionID}}" class="result-item">
+    <div class="result-meta">
+      <span class="result-project">{{.Project}}</span>
+      <span class="result-time">{{formatTime .SessionTime}}</span>
+    </div>
+    <div class="result-snippet">{{.Snippet}}</div>
+  </a>
+  {{else}}
+  <p class="empty">검색 결과가 없습니다.</p>
+  {{end}}
+</div>
+{{else if not .Query}}
+<p class="search-hint">키워드, 프로젝트, 날짜로 세션을 필터링하세요.</p>
+{{end}}
+{{end}}

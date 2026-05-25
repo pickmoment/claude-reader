@@ -1,0 +1,38 @@
+{{template "base" .}}
+{{define "title"}}프로젝트 목록 — Claude Reader{{end}}
+{{define "content"}}
+<div class="page-header">
+  <h1 class="page-title">프로젝트 목록</h1>
+  <p class="page-sub">총 {{len .Projects}}개 프로젝트</p>
+</div>
+
+<div class="project-grid">
+  {{range .Projects}}
+  <a href="/projects/{{.DirName}}" class="project-card">
+    <div class="project-card-header">
+      <span class="project-icon">◉</span>
+      <h3 class="project-name">{{.Name}}</h3>
+    </div>
+    <div class="project-card-body">
+      <div class="project-stat">
+        <span class="project-stat-num">{{len .Sessions}}</span>
+        <span class="project-stat-label">세션</span>
+      </div>
+      {{if .Sessions}}
+      <div class="project-stat">
+        <span class="project-stat-num">{{(index .Sessions 0).TurnCount}}</span>
+        <span class="project-stat-label">최근 턴</span>
+      </div>
+      {{end}}
+    </div>
+    {{if .Sessions}}
+    <div class="project-card-foot">
+      최근 활동: {{formatTime (index .Sessions 0).StartTime}}
+    </div>
+    {{end}}
+  </a>
+  {{else}}
+  <p class="empty">프로젝트가 없습니다.</p>
+  {{end}}
+</div>
+{{end}}

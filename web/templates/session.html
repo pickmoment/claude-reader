@@ -1,0 +1,157 @@
+{{template "base" .}}
+{{define "title"}}세션 — {{.Session.ProjectName}} — Claude Reader{{end}}
+{{define "content"}}
+<div class="page-header">
+  <div class="breadcrumb">
+    <a href="/projects">프로젝트</a> /
+    <a href="/projects/{{.Project.DirName}}">{{.Project.Name}}</a> /
+    <span>{{truncate .Session.ID 8}}</span>
+  </div>
+  <h1 class="page-title">세션 대화</h1>
+  <div class="session-meta-bar">
+    <span class="badge">{{.Session.TurnCount}} 턴</span>
+    {{if .Session.TotalTokens}}<span class="badge tok">{{humanizeTokens .Session.TotalTokens}} 토큰</span>{{end}}
+    <span class="time-text">{{formatTime .Session.StartTime}}</span>
+    {{if not .Session.EndTime.IsZero}}
+    <span class="time-text">→ {{formatTime .Session.EndTime}} ({{formatDuration .Session.StartTime .Session.EndTime}})</span>
+    {{end}}
+    <div class="meta-spacer"></div>
+    <button class="filter-btn" id="btn-filter-tools" onclick="toggleTools()">🔧 도구 숨기기</button>
+  </div>
+</div>
+
+<div class="conversation" id="conversation">
+  {{range .Session.Messages}}
+  <div class="msg msg-{{.Role}}{{if not (msgHasContent .)}} msg-tools-only{{end}}">
+    <div class="msg-header">
+      {{if eq .Role "user"}}
+        <span class="msg-role user-role">사용자</span>
+      {{else}}
+        <span class="msg-role asst-role">Claude{{if .Model}} <span class="model-name">{{truncate .Model 20}}</span>{{end}}</span>
+      {{end}}
+      <span class="msg-time">{{formatTime .Timestamp}}</span>
+      {{if .Usage}}
+      <span class="msg-tokens">↑{{humanizeTokens .Usage.InputTokens}} ↓{{humanizeTokens .Usage.OutputTokens}}</span>
+      {{end}}
+    </div>
+    <div class="msg-body">
+      {{range .Blocks}}
+        {{if eq .Type "text"}}
+          <div class="msg-text">{{renderMarkdown .Text}}</div>
+        {{else if eq .Type "thinking"}}
+          <details class="thinking-block">
+            <summary>💭 내부 추론</summary>
+            <div class="thinking-content">{{truncate .Text 2000}}</div>
+          </details>
+        {{else if eq .Type "tool_use"}}
+          <details class="tool-block" open>
+            <summary>🔧 <span class="tool-name">{{.Name}}</span> 도구 호출</summary>
+            <pre class="tool-input">{{truncate (printf "%s" .Input) 1000}}</pre>
+          </details>
+        {{else if eq .Type "tool_result"}}
+          <details class="tool-result-block" open>
+            <summary>📤 도구 결과</summary>
+            <pre class="tool-output">{{truncate (printf "%s" .Content) 1000}}</pre>
+          </details>
+        {{end}}
+      {{end}}
+    </div>
+  </div>
+  {{else}}
+  <p class="empty">메시지가 없습니다.</p>
+  {{end}}
+</div>
+
+<script>
+(function () {
+  var conv = document.getElementById('conversation');
+
+  // Wrap consecutive tool-only messages into a single <details class="tool-group">
+  function wrapToolGroups() {
+    var msgs = Array.from(conv.querySelectorAll('.msg'));
+    var run = [];
+
+    function flush() {
+      if (!run.length) return;
+
+      // Collect stats across all messages in the run
+      var nameCounts = {}, nameOrder = [];
+      var resultCount = 0;
+      run.forEach(function (msg) {
+        msg.querySelectorAll('.tool-block').forEach(function (el) {
+          var name = (el.querySelector('.tool-name') || { textContent: '도구' }).textContent.trim();
+          if (!nameCounts[name]) { nameCounts[name] = 0; nameOrder.push(name); }
+          nameCounts[name]++;
+        });
+        resultCount += msg.querySelectorAll('.tool-result-block').length;
+      });
+
+      var callCount = nameOrder.reduce(function (s, n) { return s + nameCounts[n]; }, 0);
+      var parts = nameOrder.map(function (n) {
+        return nameCounts[n] > 1 ? n + '(' + nameCounts[n] + ')' : n;
+      });
+
+      var labelParts = [];
+      if (callCount)   labelParts.push(callCount + '개 호출: ' + parts.join(', '));
+      if (resultCount) labelParts.push(resultCount + '개 결과');
+
+      var group = document.createElement('details');
+      group.className = 'tool-group';
+
+      var summary = document.createElement('summary');
+      summary.className = 'tool-group-summary';
+      summary.textContent = '🔧 ' + labelParts.join(' · ');
+      group.appendChild(summary);
+
+      run[0].parentNode.insertBefore(group, run[0]);
+      run.forEach(function (msg) { group.appendChild(msg); });
+      run = [];
+    }
+
+    msgs.forEach(function (msg) {
+      if (msg.classList.contains('msg-tools-only')) {
+        run.push(msg);
+      } else {
+        flush();
+      }
+    });
+    flush();
+  }
+
+  function unwrapToolGroups() {
+    conv.querySelectorAll('.tool-group').forEach(function (group) {
+      var parent = group.parentNode;
+      Array.from(group.children)
+        .filter(function (c) { return c.tagName !== 'SUMMARY'; })
+        .forEach(function (c) { parent.insertBefore(c, group); });
+      parent.removeChild(group);
+    });
+  }
+
+  function applyFilter(hide) {
+    if (!conv) return;
+    if (hide) {
+      wrapToolGroups();
+      conv.classList.add('tools-hidden');
+    } else {
+      unwrapToolGroups();
+      conv.classList.remove('tools-hidden');
+    }
+    var btn = document.getElementById('btn-filter-tools');
+    if (btn) {
+      btn.textContent = hide ? '🔧 도구 보이기' : '🔧 도구 숨기기';
+      btn.classList.toggle('active', hide);
+    }
+  }
+
+  var hidden = localStorage.getItem('hideTools') === '1';
+  applyFilter(hidden);
+
+  window.toggleTools = function () {
+    var isHidden = conv && conv.classList.contains('tools-hidden');
+    localStorage.setItem('hideTools', !isHidden ? '1' : '0');
+    applyFilter(!isHidden);
+  };
+}());
+</script>
+{{end}}

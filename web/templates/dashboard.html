@@ -1,0 +1,70 @@
+{{template "base" .}}
+{{define "title"}}대시보드 — Claude Reader{{end}}
+{{define "content"}}
+<div class="page-header">
+  <h1 class="page-title">대시보드</h1>
+  <p class="page-sub">Claude Code 사용 현황 요약</p>
+</div>
+
+<div class="stats-grid">
+  <div class="stat-card">
+    <div class="stat-value">{{.Stats.TotalProjects}}</div>
+    <div class="stat-label">프로젝트</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-value">{{.Stats.TotalSessions}}</div>
+    <div class="stat-label">세션</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-value">{{.Stats.TotalTurns}}</div>
+    <div class="stat-label">대화 턴</div>
+  </div>
+  <div class="stat-card accent">
+    <div class="stat-value">{{humanizeTokens .Stats.TotalTokens}}</div>
+    <div class="stat-label">총 토큰</div>
+  </div>
+</div>
+
+<div class="section-grid">
+  <div class="section-block">
+    <div class="section-header">
+      <h2 class="section-title">최근 세션</h2>
+      <a href="/projects" class="section-link">전체 보기 →</a>
+    </div>
+    <div class="recent-list">
+      {{range .Recents}}
+      <a href="/sessions/{{.ProjectDir}}/{{.Session.ID}}" class="recent-item">
+        <div class="recent-meta">
+          <span class="recent-project">{{.Project}}</span>
+          <span class="recent-time">{{formatTime .Session.StartTime}}</span>
+        </div>
+        <div class="recent-stats">
+          <span class="badge">{{.Session.TurnCount}} 턴</span>
+          {{if .Session.TotalTokens}}<span class="badge">{{humanizeTokens .Session.TotalTokens}} tok</span>{{end}}
+        </div>
+      </a>
+      {{else}}
+      <p class="empty">세션이 없습니다.</p>
+      {{end}}
+    </div>
+  </div>
+
+  <div class="section-block">
+    <div class="section-header">
+      <h2 class="section-title">활성 프로젝트</h2>
+      <a href="/projects" class="section-link">전체 보기 →</a>
+    </div>
+    <div class="project-mini-list">
+      {{range .Projects}}
+      <a href="/projects/{{.DirName}}" class="project-mini-item">
+        <div class="project-mini-name">{{.Name}}</div>
+        <div class="project-mini-stats">
+          <span class="badge">{{len .Sessions}} 세션</span>
+          {{if .Sessions}}<span class="time-text">{{formatDate (index .Sessions 0).StartTime}}</span>{{end}}
+        </div>
+      </a>
+      {{end}}
+    </div>
+  </div>
+</div>
+{{end}}

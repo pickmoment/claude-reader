@@ -1,0 +1,35 @@
+{{template "base" .}}
+{{define "title"}}{{.Project.Name}} — Claude Reader{{end}}
+{{define "content"}}
+<div class="page-header">
+  <div class="breadcrumb"><a href="/projects">프로젝트</a> / <span>{{.Project.Name}}</span></div>
+  <h1 class="page-title">{{.Project.Name}}</h1>
+  <p class="page-sub">{{len .Project.Sessions}}개 세션</p>
+</div>
+
+<div class="session-list">
+  {{range .Project.Sessions}}
+  <a href="/sessions/{{$.Project.DirName}}/{{.ID}}" class="session-item">
+    <div class="session-left">
+      <div class="session-id">{{truncate .ID 8}}</div>
+      <div class="session-time">{{formatTime .StartTime}}</div>
+    </div>
+    <div class="session-middle">
+      {{$preview := firstUserText .}}
+      {{if $preview}}
+      <div class="session-preview">{{truncate $preview 80}}</div>
+      {{end}}
+    </div>
+    <div class="session-right">
+      <span class="badge">{{.TurnCount}} 턴</span>
+      {{if .TotalTokens}}<span class="badge tok">{{humanizeTokens .TotalTokens}} tok</span>{{end}}
+      {{if not .EndTime.IsZero}}
+      <span class="badge dur">{{formatDuration .StartTime .EndTime}}</span>
+      {{end}}
+    </div>
+  </a>
+  {{else}}
+  <p class="empty">세션이 없습니다.</p>
+  {{end}}
+</div>
+{{end}}
