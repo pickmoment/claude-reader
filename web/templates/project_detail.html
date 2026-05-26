@@ -19,10 +19,16 @@
       {{if $preview}}
       <div class="session-preview">{{truncate $preview 80}}</div>
       {{end}}
+      {{if .ModelStats}}
+      <div class="session-models">
+        {{range .ModelStats}}<span class="session-model-tok">{{.Model}} {{humanizeTokens .Tokens}}{{if .Cost}} · {{formatCost .Cost}}{{end}}</span>{{end}}
+      </div>
+      {{end}}
     </div>
     <div class="session-right">
       <span class="badge">{{.TurnCount}} 턴</span>
       {{if .TotalTokens}}<span class="badge tok">{{humanizeTokens .TotalTokens}} tok</span>{{end}}
+      {{if .TotalCost}}<span class="badge cost">{{formatCost .TotalCost}}</span>{{end}}
       {{if not .EndTime.IsZero}}
       <span class="badge dur">{{formatDuration .StartTime .EndTime}}</span>
       {{end}}

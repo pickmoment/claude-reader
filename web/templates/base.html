@@ -4,6 +4,9 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>{{block "title" .}}Claude Reader{{end}}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;600;700&family=Noto+Serif+KR:wght@400;600;700&display=swap">
   <link rel="stylesheet" href="/static/css/style.css">
   <script>
     (function(){
@@ -23,6 +26,7 @@
     <div class="nav-links">
       <a href="/" class="nav-link">대시보드</a>
       <a href="/projects" class="nav-link">프로젝트</a>
+      <a href="/stats" class="nav-link">통계</a>
     </div>
     <form action="/search" method="get" class="nav-search">
       <input type="search" name="q" placeholder="세션 검색..." class="search-input">

@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"os/exec"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -58,9 +60,10 @@ func main() {
 		"formatDuration": formatDuration,
 		"firstUserText":  firstUserText,
 		"msgHasContent":  msgHasContent,
+		"formatCost":     formatCost,
 	}
 
-	pages := []string{"dashboard.html", "projects.html", "project_detail.html", "session.html", "search.html"}
+	pages := []string{"dashboard.html", "projects.html", "project_detail.html", "session.html", "search.html", "stats.html"}
 	pageTemplates = make(map[string]*template.Template, len(pages))
 	for _, page := range pages {
 		t, err := template.New("").Funcs(funcMap).ParseFS(webFS,
@@ -99,9 +102,25 @@ func main() {
 	mux.HandleFunc("GET /search", func(w http.ResponseWriter, r *http.Request) {
 		handleSearch(w, r, store)
 	})
+	mux.HandleFunc("GET /stats", func(w http.ResponseWriter, r *http.Request) {
+		handleStats(w, r, store)
+	})
 
 	addr := fmt.Sprintf(":%d", *port)
-	fmt.Printf("Claude Reader running at http://localhost%s\n", addr)
+	url := fmt.Sprintf("http://localhost%s", addr)
+	fmt.Printf("Claude Reader running at %s\n", url)
+	go func() {
+		var cmd *exec.Cmd
+		switch runtime.GOOS {
+		case "darwin":
+			cmd = exec.Command("open", url)
+		case "windows":
+			cmd = exec.Command("cmd", "/c", "start", url)
+		default:
+			cmd = exec.Command("xdg-open", url)
+		}
+		cmd.Run()
+	}()
 	log.Fatal(http.ListenAndServe(addr, mux))
 }
 
@@ -149,16 +168,24 @@ type Message struct {
 	Sidechain bool
 }
 
+type ModelStat struct {
+	Model  string
+	Tokens int
+	Cost   float64
+}
+
 type Session struct {
-	ID          string
-	ProjectName string
-	StartTime   time.Time
-	EndTime     time.Time
-	Messages    []Message
-	TurnCount   int
-	TotalTokens int
-	InputTokens int
+	ID           string
+	ProjectName  string
+	StartTime    time.Time
+	EndTime      time.Time
+	Messages     []Message
+	TurnCount    int
+	TotalTokens  int
+	InputTokens  int
 	OutputTokens int
+	TotalCost    float64
+	ModelStats   []ModelStat
 }
 
 type Project struct {
@@ -279,6 +306,270 @@ func (s *Store) Stats() Stats {
 	return st
 }
 
+type StatsFilter struct {
+	From        time.Time
+	To          time.Time
+	ProjectDirs []string
+}
+
+type StatPoint struct {
+	Label  string  `json:"label"`
+	Count  int     `json:"count"`
+	Tokens int     `json:"tokens"`
+	Cost   float64 `json:"cost"`
+}
+
+type ChartStats struct {
+	TotalProjects int         `json:"totalProjects"`
+	TotalSessions int         `json:"totalSessions"`
+	TotalTurns    int         `json:"totalTurns"`
+	TotalTokens   int         `json:"totalTokens"`
+	TotalCost     float64     `json:"totalCost"`
+	Daily         []StatPoint `json:"daily"`
+	Monthly       []StatPoint `json:"monthly"`
+	Weekday       []StatPoint `json:"weekday"`
+	Hourly        []StatPoint `json:"hourly"`
+	Models        []StatPoint `json:"models"`
+	Projects      []StatPoint `json:"projects"`
+}
+
+func (s *Store) ChartStats(f StatsFilter) ChartStats {
+	s.load()
+
+	loc := f.From.Location()
+
+	// Daily buckets: filter range capped at 90 days
+	nDays := int(f.To.Sub(f.From).Hours()/24) + 1
+	if nDays > 90 {
+		nDays = 90
+	}
+	if nDays < 1 {
+		nDays = 1
+	}
+	dailyStart := time.Date(f.To.Year(), f.To.Month(), f.To.Day(), 0, 0, 0, 0, loc).AddDate(0, 0, -(nDays - 1))
+	dailyIdx := make(map[string]int, nDays)
+	daily := make([]StatPoint, nDays)
+	for i := 0; i < nDays; i++ {
+		d := dailyStart.AddDate(0, 0, i)
+		daily[i].Label = d.Format("01/02")
+		dailyIdx[d.Format("2006-01-02")] = i
+	}
+
+	// Monthly buckets: full filter range (capped at 24 months)
+	fromMonth := time.Date(f.From.Year(), f.From.Month(), 1, 0, 0, 0, 0, loc)
+	toMonth := time.Date(f.To.Year(), f.To.Month(), 1, 0, 0, 0, 0, loc)
+	nMonths := 0
+	for m := fromMonth; !m.After(toMonth); m = m.AddDate(0, 1, 0) {
+		nMonths++
+	}
+	if nMonths > 24 {
+		nMonths = 24
+	}
+	if nMonths < 1 {
+		nMonths = 1
+	}
+	showYear := nMonths > 12
+	monthlyIdx := make(map[string]int, nMonths)
+	monthly := make([]StatPoint, nMonths)
+	for i := 0; i < nMonths; i++ {
+		d := fromMonth.AddDate(0, i, 0)
+		var label string
+		if showYear {
+			label = fmt.Sprintf("%02d/%02d", d.Year()%100, int(d.Month()))
+		} else {
+			label = fmt.Sprintf("%d월", int(d.Month()))
+		}
+		monthly[i].Label = label
+		monthlyIdx[d.Format("2006-01")] = i
+	}
+
+	weekdayLabels := []string{"월", "화", "수", "목", "금", "토", "일"}
+	weekday := make([]StatPoint, 7)
+	for i, lbl := range weekdayLabels {
+		weekday[i].Label = lbl
+	}
+
+	hourly := make([]StatPoint, 24)
+	for i := range hourly {
+		hourly[i].Label = fmt.Sprintf("%02d", i)
+	}
+
+	type acc struct {
+		count, tokens int
+		cost          float64
+	}
+	modelAcc := make(map[string]*acc)
+	projAcc := make(map[string]*acc)
+
+	var totalProjects, totalSessions, totalTurns, totalTokens int
+	var totalCost float64
+
+	fromDay := time.Date(f.From.Year(), f.From.Month(), f.From.Day(), 0, 0, 0, 0, loc)
+
+	projFilter := make(map[string]bool, len(f.ProjectDirs))
+	for _, d := range f.ProjectDirs {
+		projFilter[d] = true
+	}
+
+	for _, p := range s.projects {
+		if len(projFilter) > 0 && !projFilter[p.DirName] {
+			continue
+		}
+		pa := &acc{}
+		for _, sess := range p.Sessions {
+			if sess.StartTime.Before(fromDay) || sess.StartTime.After(f.To) {
+				continue
+			}
+			pa.count++
+			pa.tokens += sess.TotalTokens
+			pa.cost += sess.TotalCost
+			totalSessions++
+			totalTurns += sess.TurnCount
+			totalTokens += sess.TotalTokens
+			totalCost += sess.TotalCost
+
+			if idx, ok := dailyIdx[sess.StartTime.Format("2006-01-02")]; ok {
+				daily[idx].Count++
+				daily[idx].Tokens += sess.TotalTokens
+				daily[idx].Cost += sess.TotalCost
+			}
+			if idx, ok := monthlyIdx[sess.StartTime.Format("2006-01")]; ok {
+				monthly[idx].Count++
+				monthly[idx].Tokens += sess.TotalTokens
+				monthly[idx].Cost += sess.TotalCost
+			}
+
+			wd := (int(sess.StartTime.Weekday()) + 6) % 7
+			weekday[wd].Count++
+			weekday[wd].Tokens += sess.TotalTokens
+			weekday[wd].Cost += sess.TotalCost
+
+			h := sess.StartTime.Hour()
+			hourly[h].Count++
+			hourly[h].Tokens += sess.TotalTokens
+			hourly[h].Cost += sess.TotalCost
+
+			for _, ms := range sess.ModelStats {
+				if _, ok := modelAcc[ms.Model]; !ok {
+					modelAcc[ms.Model] = &acc{}
+				}
+				modelAcc[ms.Model].count++
+				modelAcc[ms.Model].tokens += ms.Tokens
+				modelAcc[ms.Model].cost += ms.Cost
+			}
+		}
+		if pa.count > 0 {
+			totalProjects++
+			projAcc[p.Name] = pa
+		}
+	}
+
+	type kv struct {
+		key    string
+		tokens int
+		count  int
+		cost   float64
+	}
+
+	var modelSlice []kv
+	for k, v := range modelAcc {
+		modelSlice = append(modelSlice, kv{k, v.tokens, v.count, v.cost})
+	}
+	sort.Slice(modelSlice, func(i, j int) bool { return modelSlice[i].cost > modelSlice[j].cost })
+	if len(modelSlice) > 10 {
+		modelSlice = modelSlice[:10]
+	}
+	models := make([]StatPoint, len(modelSlice))
+	for i, m := range modelSlice {
+		models[i] = StatPoint{Label: m.key, Count: m.count, Tokens: m.tokens, Cost: m.cost}
+	}
+
+	var projSlice []kv
+	for k, v := range projAcc {
+		projSlice = append(projSlice, kv{k, v.tokens, v.count, v.cost})
+	}
+	sort.Slice(projSlice, func(i, j int) bool { return projSlice[i].cost > projSlice[j].cost })
+	if len(projSlice) > 15 {
+		projSlice = projSlice[:15]
+	}
+	projects := make([]StatPoint, len(projSlice))
+	for i, p := range projSlice {
+		name := p.key
+		if len(name) > 40 {
+			name = name[:38] + "…"
+		}
+		projects[i] = StatPoint{Label: name, Count: p.count, Tokens: p.tokens, Cost: p.cost}
+	}
+
+	return ChartStats{
+		TotalProjects: totalProjects,
+		TotalSessions: totalSessions,
+		TotalTurns:    totalTurns,
+		TotalTokens:   totalTokens,
+		TotalCost:     totalCost,
+		Daily:         daily,
+		Monthly:       monthly,
+		Weekday:       weekday,
+		Hourly:        hourly,
+		Models:        models,
+		Projects:      projects,
+	}
+}
+
+// pricingFor returns $/MTok rates for input, output, cache-write, cache-read.
+// model is the shortened name without the "claude-" prefix.
+func pricingFor(model string) (inP, outP, cwP, crP float64) {
+	m := strings.ToLower(model)
+	switch {
+	case strings.Contains(m, "opus"):
+		inP, outP = 15.0, 75.0
+	case strings.Contains(m, "sonnet"):
+		inP, outP = 3.0, 15.0
+	case strings.Contains(m, "haiku-3-5") || strings.Contains(m, "haiku-4"):
+		inP, outP = 0.80, 4.0
+	case strings.Contains(m, "haiku"):
+		inP, outP = 0.25, 1.25
+	default:
+		return
+	}
+	cwP = inP * 1.25
+	crP = inP * 0.1
+	return
+}
+
+func formatCost(usd float64) string {
+	if usd < 0.0001 {
+		return ""
+	}
+	if usd < 0.01 {
+		return "<$0.01"
+	}
+	if usd >= 1000 {
+		return fmt.Sprintf("$%.1fK", usd/1000)
+	}
+	return fmt.Sprintf("$%.2f", usd)
+}
+
+func shortenModel(name string) string {
+	parts := strings.Split(name, "-")
+	if len(parts) > 0 {
+		last := parts[len(parts)-1]
+		if len(last) == 8 {
+			allDigits := true
+			for _, c := range last {
+				if c < '0' || c > '9' {
+					allDigits = false
+					break
+				}
+			}
+			if allDigits {
+				return strings.Join(parts[:len(parts)-1], "-")
+			}
+		}
+	}
+	return name
+}
+
 type SearchResult struct {
 	Project     string
 	ProjectDir  string
@@ -364,6 +655,8 @@ func parseSession(path, sessionID, projectDirName string) Session {
 		ID:          sessionID,
 		ProjectName: decodeProjectName(projectDirName),
 	}
+	type mUsage struct{ in, out, cw, cr int }
+	modelUsageMap := make(map[string]*mUsage)
 
 	lines := strings.Split(string(data), "\n")
 	for _, line := range lines {
@@ -388,6 +681,7 @@ func parseSession(path, sessionID, projectDirName string) Session {
 		}
 
 		ts, _ := time.Parse(time.RFC3339Nano, entry.Timestamp)
+		ts = ts.Local()
 
 		blocks := parseContent(raw.Content)
 		// Skip entries with no displayable content
@@ -427,8 +721,38 @@ func parseSession(path, sessionID, projectDirName string) Session {
 			sess.TotalTokens += raw.Usage.InputTokens + raw.Usage.OutputTokens
 			sess.InputTokens += raw.Usage.InputTokens + raw.Usage.CacheCreationInputTokens + raw.Usage.CacheReadInputTokens
 			sess.OutputTokens += raw.Usage.OutputTokens
+			if raw.Model != "" {
+				name := strings.TrimPrefix(shortenModel(raw.Model), "claude-")
+				u := modelUsageMap[name]
+				if u == nil {
+					u = &mUsage{}
+					modelUsageMap[name] = u
+				}
+				u.in += raw.Usage.InputTokens
+				u.out += raw.Usage.OutputTokens
+				u.cw += raw.Usage.CacheCreationInputTokens
+				u.cr += raw.Usage.CacheReadInputTokens
+			}
 		}
 	}
+
+	for name, u := range modelUsageMap {
+		inP, outP, cwP, crP := pricingFor(name)
+		cost := float64(u.in)*inP/1e6 +
+			float64(u.out)*outP/1e6 +
+			float64(u.cw)*cwP/1e6 +
+			float64(u.cr)*crP/1e6
+		sess.ModelStats = append(sess.ModelStats, ModelStat{
+			Model:  name,
+			Tokens: u.in + u.out,
+			Cost:   cost,
+		})
+		sess.TotalCost += cost
+	}
+	sort.Slice(sess.ModelStats, func(i, j int) bool {
+		return sess.ModelStats[i].Tokens > sess.ModelStats[j].Tokens
+	})
+
 	return sess
 }
 
@@ -519,6 +843,55 @@ func handleSession(w http.ResponseWriter, r *http.Request, s *Store) {
 	renderTemplate(w, "session.html", map[string]any{
 		"Session": sess,
 		"Project": proj,
+	})
+}
+
+func handleStats(w http.ResponseWriter, r *http.Request, s *Store) {
+	q := r.URL.Query()
+	now := time.Now()
+	loc := now.Location()
+
+	fromStr := q.Get("from")
+	toStr := q.Get("to")
+	projectDirs := q["project"]
+
+	var from, to time.Time
+	if fromStr != "" {
+		from, _ = time.ParseInLocation("2006-01-02", fromStr, loc)
+	}
+	if toStr != "" {
+		t, _ := time.ParseInLocation("2006-01-02", toStr, loc)
+		if !t.IsZero() {
+			to = time.Date(t.Year(), t.Month(), t.Day(), 23, 59, 59, 0, loc)
+		}
+	}
+	if from.IsZero() {
+		d := now.AddDate(0, -1, 0)
+		from = time.Date(d.Year(), d.Month(), d.Day(), 0, 0, 0, 0, loc)
+	}
+	if to.IsZero() {
+		to = time.Date(now.Year(), now.Month(), now.Day(), 23, 59, 59, 0, loc)
+	}
+
+	selectedProjects := make(map[string]bool, len(projectDirs))
+	for _, d := range projectDirs {
+		selectedProjects[d] = true
+	}
+
+	f := StatsFilter{From: from, To: to, ProjectDirs: projectDirs}
+	cs := s.ChartStats(f)
+	jsonBytes, err := json.Marshal(cs)
+	if err != nil {
+		http.Error(w, "json error", 500)
+		return
+	}
+	renderTemplate(w, "stats.html", map[string]any{
+		"Stats":            cs,
+		"StatsJSON":        template.JS(jsonBytes),
+		"FromStr":          from.Format("2006-01-02"),
+		"ToStr":            to.Format("2006-01-02"),
+		"SelectedProjects": selectedProjects,
+		"Projects":   s.Projects(),
 	})
 }
 

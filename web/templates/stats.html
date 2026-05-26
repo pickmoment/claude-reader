@@ -1,0 +1,140 @@
+{{template "base" .}}
+{{define "title"}}통계 — Claude Reader{{end}}
+{{define "content"}}
+<div class="page-header">
+  <h1 class="page-title">사용 통계</h1>
+</div>
+
+<form class="stats-filter" method="get" action="/stats">
+  <div class="stats-filter-row">
+    <label class="filter-label">기간</label>
+    <input type="date" name="from" value="{{.FromStr}}" class="filter-date">
+    <span class="filter-sep">~</span>
+    <input type="date" name="to" value="{{.ToStr}}" class="filter-date">
+    <label class="filter-label" style="margin-left:1rem">프로젝트</label>
+    <div class="project-ms" id="project-ms">
+      <button type="button" class="project-ms-trigger" id="ms-trigger">전체 프로젝트 ▾</button>
+      <div class="project-ms-panel" id="ms-panel">
+        {{range .Projects}}
+        <label class="ms-option">
+          <input type="checkbox" name="project" value="{{.DirName}}"{{if index $.SelectedProjects .DirName}} checked{{end}}>
+          {{.Name}}
+        </label>
+        {{end}}
+      </div>
+    </div>
+    <button type="submit" class="search-main-btn">적용</button>
+    <a href="/stats" class="stats-reset-btn">초기화</a>
+  </div>
+</form>
+
+<div class="stats-grid" style="grid-template-columns:repeat(5,1fr)">
+  <div class="stat-card accent">
+    <div class="stat-value">{{.Stats.TotalProjects}}</div>
+    <div class="stat-label">프로젝트</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-value">{{.Stats.TotalSessions}}</div>
+    <div class="stat-label">세션</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-value">{{.Stats.TotalTurns}}</div>
+    <div class="stat-label">턴</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-value">{{humanizeTokens .Stats.TotalTokens}}</div>
+    <div class="stat-label">총 토큰</div>
+  </div>
+  <div class="stat-card accent">
+    <div class="stat-value">{{formatCost .Stats.TotalCost}}</div>
+    <div class="stat-label">추정 비용</div>
+  </div>
+</div>
+
+<div class="chart-mode-toggle">
+  <button class="mode-btn" data-mode="cost" onclick="setChartMode('cost')">비용 ($)</button>
+  <button class="mode-btn" data-mode="tokens" onclick="setChartMode('tokens')">토큰</button>
+</div>
+
+<div class="chart-block" style="margin-bottom:1.25rem">
+  <div class="chart-header">
+    <span class="chart-title">일별 추이</span>
+    <span class="chart-sub">최근 60일</span>
+  </div>
+  <canvas id="chart-daily" class="chart-canvas" style="height:200px"></canvas>
+</div>
+
+<div class="chart-block" style="margin-bottom:1.25rem">
+  <div class="chart-header">
+    <span class="chart-title">월별 추이</span>
+    <span class="chart-sub">최근 12개월</span>
+  </div>
+  <canvas id="chart-monthly" class="chart-canvas" style="height:160px"></canvas>
+</div>
+
+<div class="chart-grid2" style="margin-bottom:1.25rem">
+  <div class="chart-block">
+    <div class="chart-header">
+      <span class="chart-title">요일별 분포</span>
+    </div>
+    <canvas id="chart-weekday" class="chart-canvas" style="height:160px"></canvas>
+  </div>
+  <div class="chart-block">
+    <div class="chart-header">
+      <span class="chart-title">시간대별 분포</span>
+    </div>
+    <canvas id="chart-hourly" class="chart-canvas" style="height:160px"></canvas>
+  </div>
+</div>
+
+<div class="chart-grid2">
+  <div class="chart-block">
+    <div class="chart-header">
+      <span class="chart-title">모델별 사용량</span>
+      <span class="chart-sub">상위 10</span>
+    </div>
+    <canvas id="chart-models" class="chart-canvas"></canvas>
+  </div>
+  <div class="chart-block">
+    <div class="chart-header">
+      <span class="chart-title">프로젝트별 사용량</span>
+      <span class="chart-sub">상위 15</span>
+    </div>
+    <canvas id="chart-projects" class="chart-canvas"></canvas>
+  </div>
+</div>
+
+<div id="chart-tooltip" class="chart-tooltip" style="display:none"></div>
+
+<script>var STATS = {{.StatsJSON}};</script>
+<script src="/static/js/charts.js"></script>
+<script>
+(function () {
+  var trigger = document.getElementById('ms-trigger');
+  var panel   = document.getElementById('ms-panel');
+  if (!trigger || !panel) return;
+
+  function updateLabel() {
+    var n = panel.querySelectorAll('input:checked').length;
+    trigger.textContent = n === 0 ? '전체 프로젝트 ▾' : n + '개 선택 ▾';
+  }
+
+  trigger.addEventListener('click', function (e) {
+    e.stopPropagation();
+    panel.classList.toggle('open');
+  });
+
+  document.addEventListener('click', function () {
+    panel.classList.remove('open');
+  });
+
+  panel.addEventListener('click', function (e) { e.stopPropagation(); });
+
+  panel.querySelectorAll('input').forEach(function (cb) {
+    cb.addEventListener('change', updateLabel);
+  });
+
+  updateLabel();
+}());
+</script>
+{{end}}
