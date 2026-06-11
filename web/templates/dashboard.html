@@ -8,20 +8,12 @@
 
 <div class="stats-grid">
   <div class="stat-card">
-    <div class="stat-value">{{.Stats.TotalProjects}}</div>
+    <div class="stat-value">{{.TotalProjects}}</div>
     <div class="stat-label">프로젝트</div>
   </div>
-  <div class="stat-card">
-    <div class="stat-value">{{.Stats.TotalSessions}}</div>
-    <div class="stat-label">세션</div>
-  </div>
-  <div class="stat-card">
-    <div class="stat-value">{{.Stats.TotalTurns}}</div>
-    <div class="stat-label">대화 턴</div>
-  </div>
   <div class="stat-card accent">
-    <div class="stat-value">{{humanizeTokens .Stats.TotalTokens}}</div>
-    <div class="stat-label">총 토큰</div>
+    <div class="stat-value">{{.TotalSessions}}</div>
+    <div class="stat-label">세션</div>
   </div>
 </div>
 
@@ -59,8 +51,8 @@
       <a href="/projects/{{.DirName}}" class="project-mini-item">
         <div class="project-mini-name">{{.Name}}</div>
         <div class="project-mini-stats">
-          <span class="badge">{{len .Sessions}} 세션</span>
-          {{if .Sessions}}<span class="time-text">{{formatDate (index .Sessions 0).StartTime}}</span>{{end}}
+          <span class="badge">{{.SessionCount}} 세션</span>
+          <span class="time-text">{{formatDate .LastActive}}</span>
         </div>
       </a>
       {{end}}

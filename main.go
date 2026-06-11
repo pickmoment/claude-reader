@@ -11,11 +11,12 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"path/filepath"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/yuin/goldmark"
@@ -186,6 +187,7 @@ type Session struct {
 	OutputTokens int
 	TotalCost    float64
 	ModelStats   []ModelStat
+	FirstText    string // first meaningful user text (pre-computed; nil Messages ok)
 }
 
 type Project struct {
@@ -194,116 +196,254 @@ type Project struct {
 	Sessions []Session
 }
 
+// ProjectSummary is a lightweight project descriptor built without parsing session content.
+type ProjectSummary struct {
+	Name          string
+	DirName       string
+	SessionCount  int
+	LastActive    time.Time // mtime of the most recently modified session file
+	LatestSession *Session  // meta-parsed; populated for projects list page
+}
+
+// RecentSessionItem is returned by Store.RecentSessions.
+type RecentSessionItem struct {
+	Project    string
+	ProjectDir string
+	Session    Session
+}
+
+// fileInfo holds per-session-file metadata from a directory scan (no JSONL parsing).
+type fileInfo struct {
+	path    string
+	id      string
+	modTime time.Time
+	size    int64
+}
+
+// projDir is one project's directory entry from a scan.
+type projDir struct {
+	name    string
+	dirName string
+	files   []fileInfo
+}
+
+// cachedMeta is a cache entry for a meta-parsed session keyed by path.
+type cachedMeta struct {
+	modTime time.Time
+	size    int64
+	sess    Session // Messages == nil
+}
+
 // ─── Store ─────────────────────────────────────────────────────────────────────
 
+// Store is a stateless-scan + mtime-keyed meta-cache store.
+// Every public method re-scans the directory listing on each call so that new,
+// deleted, or updated sessions are always reflected without a restart.
 type Store struct {
 	claudeDir string
-	projects  []Project
-	loaded    bool
+	mu        sync.Mutex
+	metaCache map[string]*cachedMeta // key: absolute file path
+	nameCache map[string]string      // dirName → decoded human-readable project name
 }
 
 func NewStore(dir string) *Store {
-	return &Store{claudeDir: dir}
+	return &Store{
+		claudeDir: dir,
+		metaCache: make(map[string]*cachedMeta),
+		nameCache: make(map[string]string),
+	}
 }
 
-func (s *Store) load() {
-	if s.loaded {
-		return
+// cachedName returns the decoded project name for dirName, computing and caching it
+// on first access. decodeProjectName does filesystem I/O, so we hold the lock only
+// around the cache read/write, not the computation.
+func (s *Store) cachedName(dirName string) string {
+	s.mu.Lock()
+	if name, ok := s.nameCache[dirName]; ok {
+		s.mu.Unlock()
+		return name
 	}
-	s.loaded = true
+	s.mu.Unlock()
+	// Compute outside lock — decodeProjectName does os.Stat per segment.
+	name := decodeProjectName(dirName)
+	s.mu.Lock()
+	s.nameCache[dirName] = name
+	s.mu.Unlock()
+	return name
+}
+
+// scan performs a Tier-1 directory scan: no JSONL parsing. Returns one projDir
+// per project directory, each with fileInfo entries for every .jsonl session file.
+// The directory listing is never cached so new/deleted files are always visible.
+func (s *Store) scan() []projDir {
 	projectsDir := filepath.Join(s.claudeDir, "projects")
 	entries, err := os.ReadDir(projectsDir)
 	if err != nil {
-		return
+		return nil
 	}
+	var result []projDir
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
 		}
-		proj := Project{
-			Name:    decodeProjectName(e.Name()),
-			DirName: e.Name(),
-		}
-		projPath := filepath.Join(projectsDir, e.Name())
+		dirName := e.Name()
+		projPath := filepath.Join(projectsDir, dirName)
 		files, _ := os.ReadDir(projPath)
+		var fis []fileInfo
 		for _, f := range files {
 			if !strings.HasSuffix(f.Name(), ".jsonl") {
 				continue
 			}
-			sessionID := strings.TrimSuffix(f.Name(), ".jsonl")
-			sess := parseSession(filepath.Join(projPath, f.Name()), sessionID, e.Name())
+			fi, err := f.Info()
+			if err != nil {
+				continue
+			}
+			id := strings.TrimSuffix(f.Name(), ".jsonl")
+			fis = append(fis, fileInfo{
+				path:    filepath.Join(projPath, f.Name()),
+				id:      id,
+				modTime: fi.ModTime(),
+				size:    fi.Size(),
+			})
+		}
+		if len(fis) == 0 {
+			continue
+		}
+		name := s.cachedName(dirName)
+		result = append(result, projDir{name: name, dirName: dirName, files: fis})
+	}
+	return result
+}
+
+// metaSession returns a Tier-2 meta-parsed Session for the given file, using the
+// mtime+size keyed cache. Parsing (without Message/Block allocation) is done
+// outside the lock; only cache reads/writes are locked.
+func (s *Store) metaSession(fi fileInfo, projectDirName string) Session {
+	s.mu.Lock()
+	if c, ok := s.metaCache[fi.path]; ok && c.modTime.Equal(fi.modTime) && c.size == fi.size {
+		sess := c.sess
+		s.mu.Unlock()
+		return sess
+	}
+	s.mu.Unlock()
+
+	projName := s.cachedName(projectDirName)
+	sess := parseSessionMeta(fi.path, fi.id, projName)
+
+	s.mu.Lock()
+	s.metaCache[fi.path] = &cachedMeta{modTime: fi.modTime, size: fi.size, sess: sess}
+	s.mu.Unlock()
+
+	return sess
+}
+
+// Counts returns project and session counts via directory scan only (zero JSONL parsing).
+func (s *Store) Counts() (projects, sessions int) {
+	dirs := s.scan()
+	for _, d := range dirs {
+		projects++
+		sessions += len(d.files)
+	}
+	return
+}
+
+// ProjectSummaries returns lightweight project descriptors sorted by most recent activity.
+// Each entry includes the mtime-based LastActive time and the meta-parsed LatestSession
+// (the single most recently modified session per project).
+func (s *Store) ProjectSummaries() []ProjectSummary {
+	dirs := s.scan()
+	summaries := make([]ProjectSummary, 0, len(dirs))
+	for _, d := range dirs {
+		var latestFi fileInfo
+		for _, f := range d.files {
+			if f.modTime.After(latestFi.modTime) {
+				latestFi = f
+			}
+		}
+		var latestSess *Session
+		if latestFi.path != "" {
+			sess := s.metaSession(latestFi, d.dirName)
+			latestSess = &sess
+		}
+		summaries = append(summaries, ProjectSummary{
+			Name:          d.name,
+			DirName:       d.dirName,
+			SessionCount:  len(d.files),
+			LastActive:    latestFi.modTime,
+			LatestSession: latestSess,
+		})
+	}
+	sort.Slice(summaries, func(i, j int) bool {
+		return summaries[i].LastActive.After(summaries[j].LastActive)
+	})
+	return summaries
+}
+
+// RecentSessions returns the n most recently modified sessions (by file mtime) across
+// all projects, each meta-parsed. Used by the dashboard.
+func (s *Store) RecentSessions(n int) []RecentSessionItem {
+	dirs := s.scan()
+	type fileWithProj struct {
+		fi       fileInfo
+		projName string
+		dirName  string
+	}
+	var allFiles []fileWithProj
+	for _, d := range dirs {
+		for _, f := range d.files {
+			allFiles = append(allFiles, fileWithProj{f, d.name, d.dirName})
+		}
+	}
+	sort.Slice(allFiles, func(i, j int) bool {
+		return allFiles[i].fi.modTime.After(allFiles[j].fi.modTime)
+	})
+	if len(allFiles) > n {
+		allFiles = allFiles[:n]
+	}
+	result := make([]RecentSessionItem, 0, len(allFiles))
+	for _, f := range allFiles {
+		sess := s.metaSession(f.fi, f.dirName)
+		result = append(result, RecentSessionItem{
+			Project:    f.projName,
+			ProjectDir: f.dirName,
+			Session:    sess,
+		})
+	}
+	return result
+}
+
+// ProjectMeta returns a Project whose sessions are all meta-parsed (no Messages/Blocks).
+// Used by the project detail page which shows per-session stat badges and preview text.
+func (s *Store) ProjectMeta(dirName string) *Project {
+	dirs := s.scan()
+	for _, d := range dirs {
+		if d.dirName != dirName {
+			continue
+		}
+		proj := &Project{Name: d.name, DirName: d.dirName}
+		for _, f := range d.files {
+			sess := s.metaSession(f, dirName)
 			proj.Sessions = append(proj.Sessions, sess)
 		}
 		sort.Slice(proj.Sessions, func(i, j int) bool {
 			return proj.Sessions[i].StartTime.After(proj.Sessions[j].StartTime)
 		})
-		if len(proj.Sessions) > 0 {
-			s.projects = append(s.projects, proj)
-		}
-	}
-	sort.Slice(s.projects, func(i, j int) bool {
-		var ti, tj time.Time
-		if len(s.projects[i].Sessions) > 0 {
-			ti = s.projects[i].Sessions[0].StartTime
-		}
-		if len(s.projects[j].Sessions) > 0 {
-			tj = s.projects[j].Sessions[0].StartTime
-		}
-		return ti.After(tj)
-	})
-}
-
-func (s *Store) Projects() []Project {
-	s.load()
-	return s.projects
-}
-
-func (s *Store) GetProject(dirName string) *Project {
-	s.load()
-	for i := range s.projects {
-		if s.projects[i].DirName == dirName {
-			return &s.projects[i]
-		}
+		return proj
 	}
 	return nil
 }
 
+// GetSession does a Tier-3 full parse of a single session file and returns it fresh.
+// Always reads the file directly so the result is guaranteed up-to-date.
 func (s *Store) GetSession(projectDirName, sessionID string) *Session {
-	proj := s.GetProject(projectDirName)
-	if proj == nil {
+	projectsDir := filepath.Join(s.claudeDir, "projects")
+	path := filepath.Join(projectsDir, projectDirName, sessionID+".jsonl")
+	if _, err := os.Stat(path); err != nil {
 		return nil
 	}
-	for i := range proj.Sessions {
-		if proj.Sessions[i].ID == sessionID {
-			return &proj.Sessions[i]
-		}
-	}
-	return nil
-}
-
-type Stats struct {
-	TotalProjects  int
-	TotalSessions  int
-	TotalTurns     int
-	TotalTokens    int
-	InputTokens    int
-	OutputTokens   int
-}
-
-func (s *Store) Stats() Stats {
-	s.load()
-	var st Stats
-	st.TotalProjects = len(s.projects)
-	for _, p := range s.projects {
-		st.TotalSessions += len(p.Sessions)
-		for _, sess := range p.Sessions {
-			st.TotalTurns += sess.TurnCount
-			st.TotalTokens += sess.TotalTokens
-			st.InputTokens += sess.InputTokens
-			st.OutputTokens += sess.OutputTokens
-		}
-	}
-	return st
+	projName := s.cachedName(projectDirName)
+	sess := parseSession(path, sessionID, projName)
+	return &sess
 }
 
 type StatsFilter struct {
@@ -334,8 +474,6 @@ type ChartStats struct {
 }
 
 func (s *Store) ChartStats(f StatsFilter) ChartStats {
-	s.load()
-
 	loc := f.From.Location()
 
 	// Daily buckets: filter range capped at 90 days
@@ -411,12 +549,14 @@ func (s *Store) ChartStats(f StatsFilter) ChartStats {
 		projFilter[d] = true
 	}
 
-	for _, p := range s.projects {
-		if len(projFilter) > 0 && !projFilter[p.DirName] {
+	dirs := s.scan()
+	for _, d := range dirs {
+		if len(projFilter) > 0 && !projFilter[d.dirName] {
 			continue
 		}
 		pa := &acc{}
-		for _, sess := range p.Sessions {
+		for _, fi := range d.files {
+			sess := s.metaSession(fi, d.dirName)
 			if sess.StartTime.Before(fromDay) || sess.StartTime.After(f.To) {
 				continue
 			}
@@ -460,7 +600,7 @@ func (s *Store) ChartStats(f StatsFilter) ChartStats {
 		}
 		if pa.count > 0 {
 			totalProjects++
-			projAcc[p.Name] = pa
+			projAcc[d.name] = pa
 		}
 	}
 
@@ -586,7 +726,6 @@ type SearchFilter struct {
 }
 
 func (s *Store) Search(f SearchFilter) []SearchResult {
-	s.load()
 	query := strings.ToLower(f.Query)
 
 	var fromTime, toTime time.Time
@@ -598,46 +737,67 @@ func (s *Store) Search(f SearchFilter) []SearchResult {
 		toTime = toTime.Add(24*time.Hour - time.Second)
 	}
 
+	dirs := s.scan()
 	var results []SearchResult
-	for _, p := range s.projects {
-		if f.ProjectDir != "" && p.DirName != f.ProjectDir {
+
+	for _, d := range dirs {
+		if f.ProjectDir != "" && d.dirName != f.ProjectDir {
 			continue
 		}
-		for _, sess := range p.Sessions {
+		// Sort files by mtime desc for consistent ordering
+		files := make([]fileInfo, len(d.files))
+		copy(files, d.files)
+		sort.Slice(files, func(i, j int) bool {
+			return files[i].modTime.After(files[j].modTime)
+		})
+
+		for _, fi := range files {
+			if query == "" {
+				// Filter-only mode: use cached meta session (no full parse)
+				sess := s.metaSession(fi, d.dirName)
+				if !fromTime.IsZero() && sess.StartTime.Before(fromTime) {
+					continue
+				}
+				if !toTime.IsZero() && sess.StartTime.After(toTime) {
+					continue
+				}
+				results = append(results, SearchResult{
+					Project:     d.name,
+					ProjectDir:  d.dirName,
+					SessionID:   fi.id,
+					SessionTime: sess.StartTime,
+					Snippet:     sess.FirstText,
+				})
+				continue
+			}
+			// Query-based search: full parse (Tier 3), discard after scanning
+			sess := parseSession(fi.path, fi.id, d.name)
 			if !fromTime.IsZero() && sess.StartTime.Before(fromTime) {
 				continue
 			}
 			if !toTime.IsZero() && sess.StartTime.After(toTime) {
 				continue
 			}
-			if query == "" {
-				// Date/project filter only — include session with first user text as snippet
-				snippet := firstUserText(sess)
-				results = append(results, SearchResult{
-					Project:     p.Name,
-					ProjectDir:  p.DirName,
-					SessionID:   sess.ID,
-					SessionTime: sess.StartTime,
-					Snippet:     snippet,
-				})
-				continue
-			}
+			found := false
 			for _, msg := range sess.Messages {
+				if found {
+					break
+				}
 				for _, b := range msg.Blocks {
 					if b.Type == "text" && strings.Contains(strings.ToLower(b.Text), query) {
 						snippet := extractSnippet(b.Text, query, 150)
 						results = append(results, SearchResult{
-							Project:     p.Name,
-							ProjectDir:  p.DirName,
-							SessionID:   sess.ID,
+							Project:     d.name,
+							ProjectDir:  d.dirName,
+							SessionID:   fi.id,
 							SessionTime: sess.StartTime,
 							Snippet:     snippet,
 						})
-						goto nextSession
+						found = true
+						break
 					}
 				}
 			}
-		nextSession:
 		}
 	}
 	return results
@@ -645,7 +805,9 @@ func (s *Store) Search(f SearchFilter) []SearchResult {
 
 // ─── JSONL Parsing ──────────────────────────────────────────────────────────────
 
-func parseSession(path, sessionID, projectDirName string) Session {
+// parseSession does a full (Tier-3) parse: builds Message/ContentBlock slices.
+// projectName is the already-decoded human-readable name (not the dir-encoded form).
+func parseSession(path, sessionID, projectName string) Session {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return Session{ID: sessionID}
@@ -653,7 +815,7 @@ func parseSession(path, sessionID, projectDirName string) Session {
 
 	sess := Session{
 		ID:          sessionID,
-		ProjectName: decodeProjectName(projectDirName),
+		ProjectName: projectName,
 	}
 	type mUsage struct{ in, out, cw, cr int }
 	modelUsageMap := make(map[string]*mUsage)
@@ -715,6 +877,17 @@ func parseSession(path, sessionID, projectDirName string) Session {
 		}
 
 		if raw.Role == "user" {
+			if sess.FirstText == "" {
+				for _, b := range blocks {
+					if b.Type == "text" {
+						t := strings.TrimSpace(b.Text)
+						if !strings.HasPrefix(t, "<") && !strings.HasPrefix(t, "Base directory") && t != "" {
+							sess.FirstText = t
+							break
+						}
+					}
+				}
+			}
 			sess.TurnCount++
 		}
 		if raw.Usage != nil {
@@ -734,6 +907,124 @@ func parseSession(path, sessionID, projectDirName string) Session {
 				u.cr += raw.Usage.CacheReadInputTokens
 			}
 		}
+	}
+
+	for name, u := range modelUsageMap {
+		inP, outP, cwP, crP := pricingFor(name)
+		cost := float64(u.in)*inP/1e6 +
+			float64(u.out)*outP/1e6 +
+			float64(u.cw)*cwP/1e6 +
+			float64(u.cr)*crP/1e6
+		sess.ModelStats = append(sess.ModelStats, ModelStat{
+			Model:  name,
+			Tokens: u.in + u.out,
+			Cost:   cost,
+		})
+		sess.TotalCost += cost
+	}
+	sort.Slice(sess.ModelStats, func(i, j int) bool {
+		return sess.ModelStats[i].Tokens > sess.ModelStats[j].Tokens
+	})
+
+	return sess
+}
+
+// parseSessionMeta does a Tier-2 parse: computes all aggregate fields (times, token
+// counts, cost, ModelStats, FirstText) but does NOT build Message or ContentBlock
+// slices, so the resulting Session.Messages is always nil.  Memory use per cached
+// entry is therefore O(1) regardless of session length.
+// projectName is the already-decoded human-readable name.
+func parseSessionMeta(path, sessionID, projectName string) Session {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return Session{ID: sessionID}
+	}
+
+	sess := Session{
+		ID:          sessionID,
+		ProjectName: projectName,
+	}
+	type mUsage struct{ in, out, cw, cr int }
+	modelUsageMap := make(map[string]*mUsage)
+
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var entry RawEntry
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			continue
+		}
+		if entry.Type != "user" && entry.Type != "assistant" {
+			continue
+		}
+		if entry.IsSidechain {
+			continue
+		}
+
+		var raw RawMessage
+		if err := json.Unmarshal(entry.Message, &raw); err != nil {
+			continue
+		}
+
+		ts, _ := time.Parse(time.RFC3339Nano, entry.Timestamp)
+		ts = ts.Local()
+
+		// Parse content to apply the same hasText filter used by parseSession,
+		// ensuring TurnCount values are identical between meta and full parse.
+		blocks := parseContent(raw.Content)
+		hasText := false
+		for _, b := range blocks {
+			if b.Type == "text" || b.Type == "tool_use" || b.Type == "tool_result" {
+				hasText = true
+				break
+			}
+		}
+		if !hasText {
+			continue
+		}
+
+		if sess.StartTime.IsZero() || ts.Before(sess.StartTime) {
+			sess.StartTime = ts
+		}
+		if ts.After(sess.EndTime) {
+			sess.EndTime = ts
+		}
+
+		if raw.Role == "user" {
+			if sess.FirstText == "" {
+				for _, b := range blocks {
+					if b.Type == "text" {
+						t := strings.TrimSpace(b.Text)
+						if !strings.HasPrefix(t, "<") && !strings.HasPrefix(t, "Base directory") && t != "" {
+							sess.FirstText = t
+							break
+						}
+					}
+				}
+			}
+			sess.TurnCount++
+		}
+		if raw.Usage != nil {
+			sess.TotalTokens += raw.Usage.InputTokens + raw.Usage.OutputTokens
+			sess.InputTokens += raw.Usage.InputTokens + raw.Usage.CacheCreationInputTokens + raw.Usage.CacheReadInputTokens
+			sess.OutputTokens += raw.Usage.OutputTokens
+			if raw.Model != "" {
+				name := strings.TrimPrefix(shortenModel(raw.Model), "claude-")
+				u := modelUsageMap[name]
+				if u == nil {
+					u = &mUsage{}
+					modelUsageMap[name] = u
+				}
+				u.in += raw.Usage.InputTokens
+				u.out += raw.Usage.OutputTokens
+				u.cw += raw.Usage.CacheCreationInputTokens
+				u.cr += raw.Usage.CacheReadInputTokens
+			}
+		}
+		// NOTE: blocks are NOT stored; no Message struct built; sess.Messages stays nil.
 	}
 
 	for name, u := range modelUsageMap {
@@ -779,49 +1070,32 @@ func parseContent(raw json.RawMessage) []ContentBlock {
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
 func handleDashboard(w http.ResponseWriter, r *http.Request, s *Store) {
-	stats := s.Stats()
-	projects := s.Projects()
-
-	// recent sessions across all projects
-	type RecentSession struct {
-		Project    string
-		ProjectDir string
-		Session    Session
+	// Tier 1 only: zero JSONL parsing for the dashboard.
+	totalProjects, totalSessions := s.Counts()
+	// Top 10 recent sessions: meta-parse of 10 files only.
+	recents := s.RecentSessions(10)
+	// Project list: meta-parse of 1 file per project (latest session only).
+	projects := s.ProjectSummaries()
+	if len(projects) > 5 {
+		projects = projects[:5]
 	}
-	var recents []RecentSession
-	for _, p := range projects {
-		for _, sess := range p.Sessions {
-			recents = append(recents, RecentSession{
-				Project:    p.Name,
-				ProjectDir: p.DirName,
-				Session:    sess,
-			})
-		}
-	}
-	sort.Slice(recents, func(i, j int) bool {
-		return recents[i].Session.StartTime.After(recents[j].Session.StartTime)
-	})
-	if len(recents) > 10 {
-		recents = recents[:10]
-	}
-
 	renderTemplate(w, "dashboard.html", map[string]any{
-		"Stats":    stats,
-		"Recents":  recents,
-		"Projects": projects[:min(5, len(projects))],
+		"TotalProjects": totalProjects,
+		"TotalSessions": totalSessions,
+		"Recents":       recents,
+		"Projects":      projects,
 	})
 }
 
 func handleProjects(w http.ResponseWriter, r *http.Request, s *Store) {
-	projects := s.Projects()
 	renderTemplate(w, "projects.html", map[string]any{
-		"Projects": projects,
+		"Projects": s.ProjectSummaries(),
 	})
 }
 
 func handleProjectDetail(w http.ResponseWriter, r *http.Request, s *Store) {
 	name := r.PathValue("name")
-	proj := s.GetProject(name)
+	proj := s.ProjectMeta(name)
 	if proj == nil {
 		http.NotFound(w, r)
 		return
@@ -832,17 +1106,19 @@ func handleProjectDetail(w http.ResponseWriter, r *http.Request, s *Store) {
 }
 
 func handleSession(w http.ResponseWriter, r *http.Request, s *Store) {
-	projectName := r.PathValue("project")
+	projectDirName := r.PathValue("project")
 	sessionID := r.PathValue("session")
-	sess := s.GetSession(projectName, sessionID)
+	sess := s.GetSession(projectDirName, sessionID)
 	if sess == nil {
 		http.NotFound(w, r)
 		return
 	}
-	proj := s.GetProject(projectName)
 	renderTemplate(w, "session.html", map[string]any{
 		"Session": sess,
-		"Project": proj,
+		"Project": &Project{
+			Name:    s.cachedName(projectDirName),
+			DirName: projectDirName,
+		},
 	})
 }
 
@@ -891,7 +1167,7 @@ func handleStats(w http.ResponseWriter, r *http.Request, s *Store) {
 		"FromStr":          from.Format("2006-01-02"),
 		"ToStr":            to.Format("2006-01-02"),
 		"SelectedProjects": selectedProjects,
-		"Projects":   s.Projects(),
+		"Projects":         s.ProjectSummaries(),
 	})
 }
 
@@ -909,7 +1185,7 @@ func handleSearch(w http.ResponseWriter, r *http.Request, s *Store) {
 	renderTemplate(w, "search.html", map[string]any{
 		"Query":    filter.Query,
 		"Filter":   filter,
-		"Projects": s.Projects(),
+		"Projects": s.ProjectSummaries(),
 		"Results":  results,
 	})
 }
@@ -1064,8 +1340,13 @@ func msgHasContent(msg Message) bool {
 	return false
 }
 
-// firstUserText returns the first meaningful user text (skips command/system lines).
+// firstUserText returns the first meaningful user text for a session.
+// For meta-parsed sessions (Messages == nil), uses the pre-computed FirstText field.
+// For full-parsed sessions (session detail view), falls back to iterating Messages.
 func firstUserText(sess Session) string {
+	if sess.FirstText != "" {
+		return sess.FirstText
+	}
 	for _, msg := range sess.Messages {
 		if msg.Role != "user" {
 			continue

@@ -15,21 +15,19 @@
     </div>
     <div class="project-card-body">
       <div class="project-stat">
-        <span class="project-stat-num">{{len .Sessions}}</span>
+        <span class="project-stat-num">{{.SessionCount}}</span>
         <span class="project-stat-label">세션</span>
       </div>
-      {{if .Sessions}}
+      {{if .LatestSession}}
       <div class="project-stat">
-        <span class="project-stat-num">{{(index .Sessions 0).TurnCount}}</span>
+        <span class="project-stat-num">{{.LatestSession.TurnCount}}</span>
         <span class="project-stat-label">최근 턴</span>
       </div>
       {{end}}
     </div>
-    {{if .Sessions}}
     <div class="project-card-foot">
-      최근 활동: {{formatTime (index .Sessions 0).StartTime}}
+      최근 활동: {{formatTime .LastActive}}
     </div>
-    {{end}}
   </a>
   {{else}}
   <p class="empty">프로젝트가 없습니다.</p>
