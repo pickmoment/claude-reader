@@ -1,4 +1,4 @@
-module claude-reader
+module github.com/pickmoment/claude-reader
 
 go 1.26.2
 

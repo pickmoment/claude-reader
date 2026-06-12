@@ -9,6 +9,7 @@ import (
 	"html/template"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -43,10 +44,11 @@ var md = goldmark.New(
 )
 
 func main() {
-	port := flag.Int("port", 8080, "HTTP port")
+	port := flag.Int("port", 5000, "starting HTTP port (increments until a free port is found)")
 	claudeDir := flag.String("dir", filepath.Join(os.Getenv("HOME"), ".claude"), "Claude data directory")
 	flag.Parse()
 
+	actualPort := findFreePort(*port)
 	store := NewStore(*claudeDir)
 
 	funcMap := template.FuncMap{
@@ -107,8 +109,8 @@ func main() {
 		handleStats(w, r, store)
 	})
 
-	addr := fmt.Sprintf(":%d", *port)
-	url := fmt.Sprintf("http://localhost%s", addr)
+	addr := fmt.Sprintf(":%d", actualPort)
+	url := fmt.Sprintf("http://localhost:%d", actualPort)
 	fmt.Printf("Claude Reader running at %s\n", url)
 	go func() {
 		var cmd *exec.Cmd
@@ -123,6 +125,18 @@ func main() {
 		cmd.Run()
 	}()
 	log.Fatal(http.ListenAndServe(addr, mux))
+}
+
+func findFreePort(start int) int {
+	for p := start; p < 65536; p++ {
+		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", p))
+		if err == nil {
+			ln.Close()
+			return p
+		}
+	}
+	log.Fatal("no free port found starting from", start)
+	return 0
 }
 
 // ─── Data Types ────────────────────────────────────────────────────────────────
@@ -658,16 +672,23 @@ func (s *Store) ChartStats(f StatsFilter) ChartStats {
 
 // pricingFor returns $/MTok rates for input, output, cache-write, cache-read.
 // model is the shortened name without the "claude-" prefix.
+// Prices from https://docs.anthropic.com/en/docs/about-claude/pricing
 func pricingFor(model string) (inP, outP, cwP, crP float64) {
 	m := strings.ToLower(model)
 	switch {
-	case strings.Contains(m, "opus"):
+	case strings.Contains(m, "fable") || strings.Contains(m, "mythos"):
+		inP, outP = 10.0, 50.0
+	case strings.Contains(m, "3-opus"): // Claude 3 Opus (deprecated)
 		inP, outP = 15.0, 75.0
+	case strings.Contains(m, "opus"): // Opus 4.5+
+		inP, outP = 5.0, 25.0
 	case strings.Contains(m, "sonnet"):
 		inP, outP = 3.0, 15.0
-	case strings.Contains(m, "haiku-3-5") || strings.Contains(m, "haiku-4"):
+	case strings.Contains(m, "haiku-4"):
+		inP, outP = 1.0, 5.0
+	case strings.Contains(m, "haiku-3-5") || strings.Contains(m, "3-5-haiku"):
 		inP, outP = 0.80, 4.0
-	case strings.Contains(m, "haiku"):
+	case strings.Contains(m, "haiku"): // Claude 3 Haiku
 		inP, outP = 0.25, 1.25
 	default:
 		return
