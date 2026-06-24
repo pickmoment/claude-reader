@@ -16,6 +16,7 @@
     <span class="time-text">→ {{formatTime .Session.EndTime}} ({{formatDuration .Session.StartTime .Session.EndTime}})</span>
     {{end}}
     <div class="meta-spacer"></div>
+    <a class="filter-btn" href="/sessions/{{.Project.DirName}}/{{.Session.ID}}/md" download>⬇ MD 다운로드</a>
     <button class="filter-btn" id="btn-filter-tools" onclick="toggleTools()">🔧 도구 숨기기</button>
   </div>
 </div>

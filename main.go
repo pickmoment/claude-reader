@@ -102,6 +102,9 @@ func main() {
 	mux.HandleFunc("GET /sessions/{project}/{session}", func(w http.ResponseWriter, r *http.Request) {
 		handleSession(w, r, store)
 	})
+	mux.HandleFunc("GET /sessions/{project}/{session}/md", func(w http.ResponseWriter, r *http.Request) {
+		handleSessionMD(w, r, store)
+	})
 	mux.HandleFunc("GET /search", func(w http.ResponseWriter, r *http.Request) {
 		handleSearch(w, r, store)
 	})
@@ -1141,6 +1144,77 @@ func handleSession(w http.ResponseWriter, r *http.Request, s *Store) {
 			DirName: projectDirName,
 		},
 	})
+}
+
+func handleSessionMD(w http.ResponseWriter, r *http.Request, s *Store) {
+	projectDirName := r.PathValue("project")
+	sessionID := r.PathValue("session")
+	sess := s.GetSession(projectDirName, sessionID)
+	if sess == nil {
+		http.NotFound(w, r)
+		return
+	}
+
+	var sb strings.Builder
+	sb.WriteString("# 세션 대화\n\n")
+	sb.WriteString("| 항목 | 값 |\n|---|---|\n")
+	sb.WriteString(fmt.Sprintf("| 프로젝트 | %s |\n", sess.ProjectName))
+	sb.WriteString(fmt.Sprintf("| 세션 ID | %s |\n", sess.ID))
+	sb.WriteString(fmt.Sprintf("| 시작 | %s |\n", formatTime(sess.StartTime)))
+	if !sess.EndTime.IsZero() {
+		sb.WriteString(fmt.Sprintf("| 종료 | %s (%s) |\n", formatTime(sess.EndTime), formatDuration(sess.StartTime, sess.EndTime)))
+	}
+	sb.WriteString(fmt.Sprintf("| 턴 수 | %d |\n", sess.TurnCount))
+	if sess.TotalTokens > 0 {
+		sb.WriteString(fmt.Sprintf("| 총 토큰 | %s |\n", humanizeTokens(sess.TotalTokens)))
+	}
+	sb.WriteString("\n---\n\n")
+
+	for _, msg := range sess.Messages {
+		switch msg.Role {
+		case "user":
+			sb.WriteString("## 사용자\n\n")
+		case "assistant":
+			model := "Claude"
+			if msg.Model != "" {
+				model = fmt.Sprintf("Claude (%s)", truncate(msg.Model, 20))
+			}
+			sb.WriteString(fmt.Sprintf("## %s\n\n", model))
+		}
+		sb.WriteString(fmt.Sprintf("*%s*\n\n", formatTime(msg.Timestamp)))
+
+		for _, b := range msg.Blocks {
+			switch b.Type {
+			case "text":
+				sb.WriteString(b.Text)
+				sb.WriteString("\n\n")
+			case "thinking":
+				sb.WriteString("<details>\n<summary>💭 내부 추론</summary>\n\n")
+				sb.WriteString(b.Text)
+				sb.WriteString("\n\n</details>\n\n")
+			case "tool_use":
+				sb.WriteString(fmt.Sprintf("**🔧 도구 호출: %s**\n\n", b.Name))
+				if len(b.Input) > 0 && string(b.Input) != "null" {
+					sb.WriteString("```json\n")
+					sb.WriteString(truncate(string(b.Input), 2000))
+					sb.WriteString("\n```\n\n")
+				}
+			case "tool_result":
+				sb.WriteString("**📤 도구 결과**\n\n")
+				if len(b.Content) > 0 && string(b.Content) != "null" {
+					sb.WriteString("```\n")
+					sb.WriteString(truncate(string(b.Content), 2000))
+					sb.WriteString("\n```\n\n")
+				}
+			}
+		}
+		sb.WriteString("---\n\n")
+	}
+
+	filename := fmt.Sprintf("session-%s.md", truncate(sess.ID, 8))
+	w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
+	fmt.Fprint(w, sb.String())
 }
 
 func handleStats(w http.ResponseWriter, r *http.Request, s *Store) {
